@@ -3,7 +3,19 @@
 Pseudo-code: guides/pseudocode/01_agent.md
 Kiểm tra:    pytest tests/test_02_agent.py
 """
+import os
+import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+from deepagents import create_deep_agent
+from deepagents.backends import LocalShellBackend
+from deepagents.backends.local_shell import ExecuteResponse
+
+from .model import make_model
+from .subagents import get_subagents
 
 # TODO 1: import các thành phần cần dùng, ví dụ:
 #   from deepagents import create_deep_agent
@@ -38,6 +50,53 @@ SUBAGENTS_NOTE = (
 # --------------------------------------------------------------------------------------------------
 
 
+class WindowsShellBackend(LocalShellBackend):
+    """Run the small Unix command vocabulary used by this lab through PowerShell.
+
+    LocalShellBackend uses ``cmd.exe`` on Windows, while the provided exercises and
+    prompts use Unix commands such as ``ls`` and ``cat``. The normal backend remains
+    unchanged on macOS/Linux; this adapter keeps Windows-only offline tests portable.
+    """
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        parts = [part.strip() for part in command.split("&&")]
+        output = []
+        try:
+            for part in parts:
+                if match := re.fullmatch(r"which\s+([\w.-]+)", part):
+                    found = shutil.which(match.group(1), path=self._env.get("PATH"))
+                    if not found:
+                        return ExecuteResponse(output=f"which: {match.group(1)} not found", exit_code=1)
+                    output.append(found)
+                elif part == "env":
+                    output.extend(f"{key}={value}" for key, value in sorted(self._env.items()))
+                elif match := re.fullmatch(r"cat\s+(.+)", part):
+                    output.append((self.cwd / match.group(1).strip()).read_text(encoding="utf-8"))
+                elif match := re.fullmatch(r"ls(?:\s+(.+))?", part):
+                    directory = self.cwd / (match.group(1).strip() if match.group(1) else ".")
+                    output.extend(item.name for item in sorted(directory.iterdir()))
+                else:
+                    result = subprocess.run(
+                        part,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout or self._default_timeout,
+                        env=self._env,
+                        cwd=str(self.cwd),
+                    )
+                    output.append(result.stdout)
+                    if result.stderr:
+                        output.extend(f"[stderr] {line}" for line in result.stderr.splitlines())
+                    if result.returncode:
+                        return ExecuteResponse(output="\n".join(output), exit_code=result.returncode)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(output="Error: Command timed out.", exit_code=124)
+        except OSError as exc:
+            return ExecuteResponse(output=f"Error executing command: {exc}", exit_code=1)
+        return ExecuteResponse(output="\n".join(output) or "<no output>", exit_code=0)
+
+
 def make_backend(sandbox: Path):
     """Tạo backend (môi trường thực thi) cho tác tử.
 
@@ -47,7 +106,20 @@ def make_backend(sandbox: Path):
       - Tác tử chạy được lệnh shell và gọi được `python` (cần đặt PATH).
       - KHÔNG chuyển biến môi trường của bạn vào shell của tác tử (khóa API không được lộ).
     """
-    raise NotImplementedError("TODO 2: cài đặt make_backend (xem guides/pseudocode/01_agent.md)")
+    python_dir = str(Path(sys.executable).resolve().parent)
+    env = {
+        "PATH": os.pathsep.join([python_dir, "/usr/local/bin", "/usr/bin", "/bin"]),
+        "HOME": str(sandbox),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    backend_type = WindowsShellBackend if os.name == "nt" else LocalShellBackend
+    return backend_type(
+        root_dir=sandbox,
+        virtual_mode=True,
+        inherit_env=False,
+        env=env,
+        timeout=120,
+    )
 
 
 def build_agent(sandbox: Path, mode: str = "single", use_skills: bool = False, model=None):
@@ -64,4 +136,24 @@ def build_agent(sandbox: Path, mode: str = "single", use_skills: bool = False, m
     mode không hợp lệ -> ném ValueError.
     Trả về: đồ thị (graph) đã biên dịch, gọi bằng `.invoke({"messages": [...]})`.
     """
-    raise NotImplementedError("TODO 3: cài đặt build_agent (xem guides/pseudocode/01_agent.md)")
+    if mode not in {"single", "subagents"}:
+        raise ValueError(f"unknown mode: {mode}")
+
+    kwargs = {}
+    prompt = BASE_PROMPT
+    if mode == "subagents":
+        kwargs["subagents"] = [
+            {**sub, "system_prompt": sub["system_prompt"] + " " + PATHS_NOTE}
+            for sub in get_subagents()
+        ]
+        prompt += SUBAGENTS_NOTE
+    if use_skills:
+        kwargs["skills"] = ["/skills/"]
+        prompt += SKILLS_NOTE
+
+    return create_deep_agent(
+        model=model or make_model(),
+        system_prompt=prompt,
+        backend=make_backend(sandbox),
+        **kwargs,
+    )

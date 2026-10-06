@@ -4,8 +4,12 @@ Pseudo-code: guides/pseudocode/04_curator.md
 Kiểm tra:    pytest tests/test_04_curator.py
 Chạy thật:   python -m lab.curator
 """
+import json
 import re
 from pathlib import Path
+
+from .model import make_model
+from .tasks import ROOT
 
 from .tasks import eval_markers   # có sẵn: định danh của tác vụ đánh giá, tính lúc chạy
 
@@ -68,7 +72,61 @@ def curate_skills(results_dir="results", source_condition="baseline", out_dir=No
     model mặc định: make_model() (lab.model).
     Trả về: danh sách đường dẫn SKILL.md đã ghi.
     """
-    raise NotImplementedError("TODO: cài đặt curate_skills (xem guides/pseudocode/04_curator.md)")
+    out_dir = Path(out_dir) if out_dir is not None else ROOT / "skills" / "auto"
+    runs = []
+    source = Path(results_dir) / source_condition
+    if source.exists():
+        for run_file in sorted(source.glob("*/run.json")):
+            run = json.loads(run_file.read_text(encoding="utf-8"))
+            if run.get("role") != "learn":
+                continue
+            failed = [
+                (check.get("name", ""), check.get("detail", ""))
+                for check in run.get("checks", [])
+                if not check.get("passed", False)
+            ]
+            trace_file = run_file.parent / "trace.md"
+            trace = trace_file.read_text(encoding="utf-8")[-6000:] if trace_file.exists() else ""
+            runs.append({"task": run.get("task", run_file.parent.name), "failed": failed, "trace": trace})
+
+    failed_runs = [run for run in runs if run["failed"]]
+    if not failed_runs:
+        print("warning: no failed checks in learning tasks")
+        return []
+
+    sections = []
+    for run in failed_runs:
+        checks = "\n".join(f"- {name}: {detail}" for name, detail in run["failed"])
+        sections.append(f"Task: {run['task']}\nFailed checks:\n{checks}\nTrace:\n{run['trace']}")
+    prompt = f"""You write reusable SKILL.md files for a programming and data-analysis agent.
+Below are failed checks and traces from learning tasks. Find general process mistakes, not task-specific answers.
+Write at most {max_skills} concise skills.
+
+Rules:
+- Do not mention task ids, task-specific file names, answers, numbers, or evaluation material.
+- Each skill must have YAML frontmatter with lowercase kebab-case name and a one-sentence description saying when to use it.
+- Keep the body actionable and short.
+- Use this exact format for each skill:
+=== SKILL: <name> ===
+---
+name: <name>
+description: <when to use it>
+---
+<instructions>
+=== END ===
+
+Learning-run evidence:
+{chr(10).join(sections)}"""
+    reply = (model or make_model()).invoke(prompt).content
+    written = []
+    for name, text in parse_skill_blocks(reply):
+        if len(written) >= max_skills or validate_skill(text, expected_name=name):
+            continue
+        path = out_dir / name / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        written.append(path)
+    return written
 
 
 if __name__ == "__main__":
